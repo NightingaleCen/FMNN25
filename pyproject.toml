@@ -7,4 +7,8 @@ dependencies = [
     "jupyter-collaboration>=5.0.2",
     "jupyter-mcp-tools>=0.1.7",
     "jupyterlab>=4.6.3",
+    "matplotlib>=3.11.1",
+    "mpi4py>=4.1.2",
+    "numpy>=2.5.3",
+    "scipy>=1.18.1",
 ]
