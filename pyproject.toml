@@ -1,0 +1,10 @@
+[project]
+name = "fmnn25"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "ipykernel>=7.3.0",
+    "jupyter-collaboration>=5.0.2",
+    "jupyter-mcp-tools>=0.1.7",
+    "jupyterlab>=4.6.3",
+]
