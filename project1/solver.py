@@ -84,7 +84,11 @@ def neumann_matrix(n, side, sparse=False):
 
 
 def center_boundary(n, gamma1, gamma2, wall, heater, window):
-    """Create the middle-room grid with its Dirichlet boundary values."""
+    """
+    Create the middle-room grid with its Dirichlet boundary values.
+
+    corner nodes are set to the average of the two adjacent boundaries.
+    """
     u = np.full((2 * n + 1, n + 1), wall)
     u[0, :] = window
     u[-1, :] = heater
