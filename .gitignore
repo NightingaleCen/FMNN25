@@ -5,3 +5,4 @@ __pycache__/
 .jupyter/
 .jupyter_ystore.db
 *.npz
+.DS_Store
