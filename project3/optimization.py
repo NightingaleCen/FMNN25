@@ -1,27 +1,20 @@
-"""Optimization methods for Project 3, following lecture_opt.pdf.
-
-The slide-21 Powell-Wolfe rule replaces the assignment's Fletcher algorithm.
-Its defaults are slide examples, not the missing Fletcher page-37 parameters.
-Quasi-Newton runs start with H = I; unsafe update denominators are skipped and
-counted in skipped_updates. Line searches reject non-descent directions.
-"""
-
-from collections.abc import Callable
+"""Newton and quasi-Newton methods with exact and inexact line search."""
 
 import numpy as np
+from scipy.optimize import minimize_scalar
 
 
 class OptimizationProblem:
     """Store an objective and an optional analytic gradient."""
 
-    def __init__(self, objective_function: Callable, gradient_function: Callable | None = None):
+    def __init__(self, objective_function, gradient_function=None):
         self.objective_function = objective_function
         self.gradient_function = gradient_function
 
-    def objective(self, x: np.ndarray) -> float:
+    def objective(self, x):
         return float(self.objective_function(np.asarray(x, dtype=float)))
 
-    def gradient(self, x: np.ndarray) -> np.ndarray:
+    def gradient(self, x):
         x = np.asarray(x, dtype=float)
         if self.gradient_function is not None:
             return np.asarray(self.gradient_function(x), dtype=float)
@@ -31,12 +24,12 @@ class OptimizationProblem:
             for e in np.eye(len(x))
         ])
 
-    def __call__(self, x: np.ndarray) -> float:
+    def __call__(self, x):
         return self.objective(x)
 
 
 class OptimizationMethod:
-    """Shared iteration, gradient stopping criterion, and iterate history."""
+    """Common iteration loop for the optimization methods."""
 
     def __init__(self, problem, line_search=None, tol=1e-6, max_iter=1000):
         self.problem = problem
@@ -44,17 +37,19 @@ class OptimizationMethod:
         self.tol = tol
         self.max_iter = max_iter
         self.history = []
+        self.converged = False
 
     def search_direction(self, x, g):
         raise NotImplementedError
 
     def update(self, delta, gamma):
-        """Update a quasi-Newton approximation; classical Newton needs no update."""
+        pass
 
     def solve(self, x0):
         x = np.asarray(x0, dtype=float).copy()
         g = self.problem.gradient(x)
         self.history = [x.copy()]
+        self.converged = False
         for _ in range(self.max_iter):
             if np.linalg.norm(g) < self.tol:
                 break
@@ -65,11 +60,12 @@ class OptimizationMethod:
             self.update(x_new - x, g_new - g)
             x, g = x_new, g_new
             self.history.append(x.copy())
+        self.converged = bool(np.linalg.norm(g) < self.tol)
         return x
 
 
 class Newton(OptimizationMethod):
-    """Newton direction with a symmetrized finite-difference Hessian."""
+    """Newton's method with a finite-difference Hessian."""
 
     def __init__(self, problem, line_search=None, tol=1e-6, max_iter=1000, h=1e-6):
         super().__init__(problem, line_search, tol, max_iter)
@@ -88,9 +84,7 @@ class Newton(OptimizationMethod):
 
 
 def exact_line_search(problem, x, s, max_iter=100):
-    """Numerically minimize along the positive ray using a positive Brent bracket."""
-    from scipy.optimize import minimize_scalar
-
+    """Minimize f(x + alpha*s) for alpha >= 0."""
     if problem.gradient(x) @ s >= 0:
         raise ValueError("Line search requires a descent direction.")
     phi = lambda alpha: problem(x + alpha * s)
@@ -102,12 +96,17 @@ def exact_line_search(problem, x, s, max_iter=100):
             break
         b *= 0.5
     else:
-        raise RuntimeError("Could not find a decreasing positive step.")
+        raise RuntimeError("No decreasing step found.")
     c = 2 * b
     for _ in range(max_iter):
         fc = phi(c)
-        if np.isfinite(fc) and fc > fb:
-            result = minimize_scalar(phi, bracket=(a, b, c), method="brent", tol=1e-12)
+        if np.isfinite(fc) and fc >= fb:
+            if fc > fb:
+                result = minimize_scalar(phi, bracket=(a, b, c), method="brent", tol=1e-12)
+            else:
+                result = minimize_scalar(
+                    phi, bounds=(a, c), method="bounded", options={"xatol": 1e-12},
+                )
             if not result.success:
                 raise RuntimeError(result.message)
             return float(result.x)
@@ -116,57 +115,66 @@ def exact_line_search(problem, x, s, max_iter=100):
         else:
             a, b, fb = b, c, fc
             c *= 2
-    raise RuntimeError("Could not bracket a finite line minimum.")
+    raise RuntimeError("Could not bracket a minimum.")
 
 
-def powell_wolfe_line_search(problem, x, s, sigma=1e-2, rho=0.9, alpha0=2.0, max_iter=100):
-    """Slide 21: halve for Armijo, double to bracket, then bisect for weak Wolfe."""
-    if not (0 < sigma < 0.5 and sigma < rho < 1 and alpha0 > 0):
-        raise ValueError("Require 0 < sigma < 1/2, sigma < rho < 1, and alpha0 > 0.")
+def fletcher_line_search(
+    problem, x, s, rho=0.01, sigma=0.1, alpha0=1.0,
+    tau1=9.0, tau2=0.1, tau3=0.5, f_lower=None, max_iter=100,
+):
+    """Bracket and section a step satisfying sufficient decrease and strong Wolfe."""
     f0 = problem(x)
     d0 = float(problem.gradient(x) @ s)
     if d0 >= 0:
-        raise ValueError("Powell-Wolfe requires a descent direction.")
+        raise ValueError("Line search requires a descent direction.")
+    mu = np.inf if f_lower is None else (f_lower - f0) / (rho * d0)
 
-    def armijo(alpha):
+    previous, f_previous = 0.0, f0
+    alpha = min(float(alpha0), mu)
+    for _ in range(max_iter):
         value = problem(x + alpha * s)
-        return np.isfinite(value) and value <= f0 + sigma * alpha * d0
-
-    lower = float(alpha0)
-    for _ in range(max_iter):
-        if armijo(lower):
+        if f_lower is not None and value <= f_lower:
+            return alpha
+        if (not np.isfinite(value) or value > f0 + rho * alpha * d0
+                or value >= f_previous):
+            a, b, fa = previous, alpha, f_previous
             break
-        lower *= 0.5
+        slope = float(problem.gradient(x + alpha * s) @ s)
+        if abs(slope) <= -sigma * d0:
+            return alpha
+        if slope >= 0:
+            a, b, fa = alpha, previous, value
+            break
+        next_alpha = min(mu, alpha + tau1 * (alpha - previous))
+        previous, f_previous, alpha = alpha, value, next_alpha
     else:
-        raise RuntimeError("Armijo halving did not find an acceptable step.")
-
-    upper = lower
-    for _ in range(max_iter):
-        if not armijo(upper):
-            break
-        upper *= 2
-    else:
-        raise RuntimeError("Armijo doubling did not bracket an upper endpoint.")
+        raise RuntimeError("Could not bracket an acceptable step.")
 
     for _ in range(max_iter):
-        if problem.gradient(x + lower * s) @ s >= rho * d0:
-            return lower
-        middle = 0.5 * (lower + upper)
-        if middle == lower or middle == upper:
+        # The endpoints can be reversed; retain their orientation.
+        alpha = a + np.clip(0.5, tau2, 1 - tau3) * (b - a)
+        if alpha == a or alpha == b:
             break
-        if armijo(middle):
-            lower = middle
-        else:
-            upper = middle
-    raise RuntimeError("Bisection did not satisfy the Powell-Wolfe curvature condition.")
+        value = problem(x + alpha * s)
+        if f_lower is not None and value <= f_lower:
+            return alpha
+        if not np.isfinite(value) or value > f0 + rho * alpha * d0 or value >= fa:
+            b = alpha
+            continue
+        slope = float(problem.gradient(x + alpha * s) @ s)
+        if abs(slope) <= -sigma * d0:
+            return alpha
+        if slope * (b - a) >= 0:
+            b = a
+        a, fa = alpha, value
+    raise RuntimeError("No acceptable step found during sectioning.")
 
 
 class QuasiNewton(Newton):
-    """Shared inverse-Hessian state for the five Newton subclasses."""
+    """Use an inverse-Hessian approximation, starting from the identity."""
 
     def solve(self, x0):
         self.H = np.eye(len(x0))
-        self.skipped_updates = 0
         return super().solve(x0)
 
     def search_direction(self, x, g):
@@ -174,42 +182,39 @@ class QuasiNewton(Newton):
 
 
 class GoodBroyden(QuasiNewton):
-    """Slide 27: inverse of the good Broyden Hessian update via Sherman-Morrison."""
+    """Good Broyden update, inverted with Sherman-Morrison."""
 
     def update(self, delta, gamma):
         row = delta @ self.H
         denominator = row @ gamma
         if abs(denominator) <= 1e-12 * np.linalg.norm(row) * np.linalg.norm(gamma):
-            self.skipped_updates += 1
             return
         self.H += np.outer(delta - self.H @ gamma, row) / denominator
 
 
 class BadBroyden(QuasiNewton):
-    """Slide 28: direct rank-one update of the inverse Hessian."""
+    """Rank-one update of the inverse Hessian."""
 
     def update(self, delta, gamma):
         denominator = gamma @ gamma
         if denominator == 0:
-            self.skipped_updates += 1
             return
         self.H += np.outer(delta - self.H @ gamma, gamma) / denominator
 
 
 class SymmetricBroyden(QuasiNewton):
-    """Slide 30: symmetric rank-one (SR1) inverse-Hessian update."""
+    """Symmetric rank-one (SR1) update."""
 
     def update(self, delta, gamma):
         u = delta - self.H @ gamma
         denominator = u @ gamma
         if abs(denominator) <= 1e-8 * np.linalg.norm(u) * np.linalg.norm(gamma):
-            self.skipped_updates += 1
             return
         self.H += np.outer(u, u) / denominator
 
 
 class DFP(QuasiNewton):
-    """Slide 31: DFP inverse-Hessian rank-two update."""
+    """DFP inverse-Hessian update."""
 
     def update(self, delta, gamma):
         Hg = self.H @ gamma
@@ -217,39 +222,19 @@ class DFP(QuasiNewton):
         denominator = gamma @ Hg
         if (curvature <= 1e-12 * np.linalg.norm(delta) * np.linalg.norm(gamma)
                 or denominator <= 1e-12 * np.linalg.norm(gamma) * np.linalg.norm(Hg)):
-            self.skipped_updates += 1
             return
         self.H += np.outer(delta, delta) / curvature - np.outer(Hg, Hg) / denominator
 
 
 class BFGS(QuasiNewton):
-    """Slide 32: expanded BFGS inverse-Hessian rank-two update."""
+    """BFGS inverse-Hessian update."""
 
     def update(self, delta, gamma):
         Hg = self.H @ gamma
         curvature = delta @ gamma
         if curvature <= 1e-12 * np.linalg.norm(delta) * np.linalg.norm(gamma):
-            self.skipped_updates += 1
             return
         self.H += (
             (1 + (gamma @ Hg) / curvature) * np.outer(delta, delta) / curvature
             - (np.outer(delta, Hg) + np.outer(Hg, delta)) / curvature
         )
-
-
-def objective(x):
-    return (x[0] - 1) ** 2 + (x[1] - 2) ** 2
-
-
-def gradient(x):
-    return np.array([2 * (x[0] - 1), 2 * (x[1] - 2)])
-
-
-def rosenbrock(x):
-    x1, x2 = x
-    return 100 * (x2 - x1**2) ** 2 + (1 - x1) ** 2
-
-
-def rosenbrock_gradient(x):
-    x1, x2 = x
-    return np.array([-400 * x1 * (x2 - x1**2) + 2 * (x1 - 1), 200 * (x2 - x1**2)])
