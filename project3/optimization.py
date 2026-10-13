@@ -5,7 +5,7 @@ from scipy.optimize import minimize_scalar
 
 
 class OptimizationProblem:
-    """Store an objective and an optional analytic gradient."""
+    """Class for optimization problems with an objective and optional gradient."""
 
     def __init__(self, objective_function, gradient_function=None):
         self.objective_function = objective_function
@@ -20,7 +20,7 @@ class OptimizationProblem:
             return np.asarray(self.gradient_function(x), dtype=float)
         h = 1e-6
         return np.array([
-            (self.objective(x + h * e) - self.objective(x - h * e)) / (2 * h)
+            (self.objective(x + h * e) - self.objective(x - h * e)) / (2 * h) # central difference
             for e in np.eye(len(x))
         ])
 
@@ -29,7 +29,7 @@ class OptimizationProblem:
 
 
 class OptimizationMethod:
-    """Common iteration loop for the optimization methods."""
+    """A general optimization method class for quasi-newton methods with line search."""
 
     def __init__(self, problem, line_search=None, tol=1e-6, max_iter=1000):
         self.problem = problem
@@ -40,9 +40,11 @@ class OptimizationMethod:
         self.converged = False
 
     def search_direction(self, x, g):
+        ''' To be implemented in subclasses. Returns the search direction given the current point x and gradient g.'''
         raise NotImplementedError
 
     def update(self, delta, gamma):
+        ''' To be implemented in subclasses. Updates the internal state of the optimization method.'''
         pass
 
     def solve(self, x0):
@@ -54,8 +56,8 @@ class OptimizationMethod:
             if np.linalg.norm(g) < self.tol:
                 break
             s = self.search_direction(x, g)
-            alpha = 1.0 if self.line_search is None else self.line_search(self.problem, x, s)
-            x_new = x + alpha * s
+            alpha = 1.0 if self.line_search is None else self.line_search(self.problem, x, s) # use line search if provided
+            x_new = x + alpha * s # iterate here
             g_new = self.problem.gradient(x_new)
             self.update(x_new - x, g_new - g)
             x, g = x_new, g_new
@@ -77,7 +79,7 @@ class Newton(OptimizationMethod):
             / (2 * self.h)
             for e in np.eye(len(x))
         ])
-        return 0.5 * (G + G.T)
+        return 0.5 * (G + G.T) # symmetrizing step
 
     def search_direction(self, x, g):
         return np.linalg.solve(self.hessian(x), -g)
@@ -85,28 +87,26 @@ class Newton(OptimizationMethod):
 
 def exact_line_search(problem, x, s, max_iter=100):
     """Minimize f(x + alpha*s) for alpha >= 0."""
-    if problem.gradient(x) @ s >= 0:
+    if problem.gradient(x) @ s >= 0: # ensure descent direction
         raise ValueError("Line search requires a descent direction.")
     phi = lambda alpha: problem(x + alpha * s)
     a, b = 0.0, 1.0
     fa = phi(a)
     for _ in range(max_iter):
         fb = phi(b)
-        if np.isfinite(fb) and fb < fa:
+        if np.isfinite(fb) and fb < fa: # find a point that is lower than the starting point a
             break
         b *= 0.5
     else:
         raise RuntimeError("No decreasing step found.")
+    
     c = 2 * b
     for _ in range(max_iter):
         fc = phi(c)
-        if np.isfinite(fc) and fc >= fb:
-            if fc > fb:
-                result = minimize_scalar(phi, bracket=(a, b, c), method="brent", tol=1e-12)
-            else:
-                result = minimize_scalar(
-                    phi, bounds=(a, c), method="bounded", options={"xatol": 1e-12},
-                )
+        if np.isfinite(fc) and fc >= fb: # find a point that is higher than (or equal) the previous point b
+            result = minimize_scalar(
+                phi, bounds=(a, c), method="bounded", options={"xatol": 1e-12},
+            )
             if not result.success:
                 raise RuntimeError(result.message)
             return float(result.x)
@@ -122,52 +122,59 @@ def fletcher_line_search(
     problem, x, s, rho=0.01, sigma=0.1, alpha0=1.0,
     tau1=9.0, tau2=0.1, tau3=0.5, f_lower=None, max_iter=100,
 ):
-    """Bracket and section a step satisfying sufficient decrease and strong Wolfe."""
+    """Line search algorithm from Fletcher's book"""
     f0 = problem(x)
     d0 = float(problem.gradient(x) @ s)
     if d0 >= 0:
         raise ValueError("Line search requires a descent direction.")
     mu = np.inf if f_lower is None else (f_lower - f0) / (rho * d0)
 
+    # (2.6.2) bracketing phase
     previous, f_previous = 0.0, f0
     alpha = min(float(alpha0), mu)
     for _ in range(max_iter):
         value = problem(x + alpha * s)
+
         if f_lower is not None and value <= f_lower:
             return alpha
-        if (not np.isfinite(value) or value > f0 + rho * alpha * d0
+        
+        if (not np.isfinite(value) or value > f0 + rho * alpha * d0 # condition 1
                 or value >= f_previous):
             a, b, fa = previous, alpha, f_previous
-            break
+            break # terminate B
+
         slope = float(problem.gradient(x + alpha * s) @ s)
-        if abs(slope) <= -sigma * d0:
+        if abs(slope) <= -sigma * d0: # condition 2
             return alpha
+        
         if slope >= 0:
             a, b, fa = alpha, previous, value
-            break
-        next_alpha = min(mu, alpha + tau1 * (alpha - previous))
+            break # terminate B
+
+        next_alpha = min(mu, alpha + tau1 * (alpha - previous)) # we choose the upper bound from (2.6.2)
         previous, f_previous, alpha = alpha, value, next_alpha
     else:
         raise RuntimeError("Could not bracket an acceptable step.")
 
+    # (2.6.3) sectioning phase
     for _ in range(max_iter):
-        # The endpoints can be reversed; retain their orientation.
-        alpha = a + np.clip(0.5, tau2, 1 - tau3) * (b - a)
-        if alpha == a or alpha == b:
-            break
+        alpha = a + np.clip(0.5, tau2, 1 - tau3) * (b - a) # choose middle point if possible, otherwise choose the lower or upper bound
+
         value = problem(x + alpha * s)
-        if f_lower is not None and value <= f_lower:
+        if f_lower is not None and value <= f_lower: # end early if we reach an acceptable value
             return alpha
-        if not np.isfinite(value) or value > f0 + rho * alpha * d0 or value >= fa:
+        
+        if value > f0 + rho * alpha * d0 or value >= fa: # condition 1
             b = alpha
             continue
+
         slope = float(problem.gradient(x + alpha * s) @ s)
-        if abs(slope) <= -sigma * d0:
+        if abs(slope) <= -sigma * d0: # condition 2
             return alpha
+        
         if slope * (b - a) >= 0:
             b = a
         a, fa = alpha, value
-    raise RuntimeError("No acceptable step found during sectioning.")
 
 
 class QuasiNewton(Newton):
